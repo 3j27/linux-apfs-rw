@@ -80,6 +80,8 @@ static int apfs_xts_crypt(struct crypto_skcipher *tfm, const void *src,
 		return -ENOMEM;
 
 	while (done < len) {
+		/* The walk may modify the IV in place for the next block */
+		memset(iv, 0, sizeof(iv));
 		put_unaligned_le64(sector, iv);
 		sg_init_one(&src_sg, (const u8 *)src + done, 512);
 		sg_init_one(&dst_sg, (u8 *)dst + done, 512);
@@ -286,7 +288,7 @@ static int apfs_aes_kw_unwrap(const u8 *kek, unsigned int kek_len,
 	struct crypto_skcipher *tfm;
 	struct skcipher_request *req;
 	struct scatterlist sg;
-	u8 block[16];
+	u8 *block;
 	unsigned int n, j;
 	int i, err = 0;
 
@@ -306,9 +308,19 @@ static int apfs_aes_kw_unwrap(const u8 *kek, unsigned int kek_len,
 	n = wrapped_len / 8 - 1;
 	memcpy(out, wrapped, wrapped_len);
 
+	/*
+	 * The block has to be page-backed: the skcipher walk flushes the
+	 * dcache of the scatterlist pages, and a stack buffer is not a page.
+	 */
+	block = kmalloc(16, GFP_NOFS);
+	if (!block)
+		return -ENOMEM;
+
 	tfm = crypto_alloc_skcipher("ecb(aes)", 0, 0);
-	if (IS_ERR(tfm))
+	if (IS_ERR(tfm)) {
+		kfree(block);
 		return PTR_ERR(tfm);
+	}
 	err = crypto_skcipher_setkey(tfm, kek, kek_len);
 	if (err)
 		goto out_free;
@@ -327,8 +339,8 @@ static int apfs_aes_kw_unwrap(const u8 *kek, unsigned int kek_len,
 			a = get_unaligned_be64(block) ^ t;
 			put_unaligned_be64(a, block);
 			memcpy(block + 8, out + i * 8, 8);
-			sg_init_one(&sg, block, sizeof(block));
-			skcipher_request_set_crypt(req, &sg, &sg, sizeof(block), NULL);
+			sg_init_one(&sg, block, 16);
+			skcipher_request_set_crypt(req, &sg, &sg, 16, NULL);
 			err = crypto_skcipher_decrypt(req);
 			if (err)
 				break;
@@ -341,7 +353,8 @@ static int apfs_aes_kw_unwrap(const u8 *kek, unsigned int kek_len,
 
 	skcipher_request_free(req);
 out_free:
-	memzero_explicit(block, sizeof(block));
+	memzero_explicit(block, 16);
+	kfree(block);
 	crypto_free_skcipher(tfm);
 	return err;
 }
@@ -610,6 +623,7 @@ static void apfs_volume_keybag_entry(struct apfs_keybag_scan *scan,
 				     const u8 *data, unsigned int len)
 {
 	struct apfs_kek kek;
+	unsigned int kek_len = 32;	/* capacity of the scan's buffer */
 
 	(void)uuid;
 	if (tag != APFS_KEYBAG_TAG_VOLBAG || !scan->password)
@@ -617,8 +631,10 @@ static void apfs_volume_keybag_entry(struct apfs_keybag_scan *scan,
 	if (apfs_parse_kek(data, len, &kek))
 		return;
 	if (!apfs_kek_unlock_password(&kek, scan->password, scan->kek,
-				      &scan->kek_len))
+				      &kek_len)) {
+		scan->kek_len = kek_len;
 		scan->found_kek = true;
+	}
 }
 
 static int apfs_scan_keybag(struct super_block *sb, u64 start, u64 count,
@@ -840,11 +856,14 @@ int apfs_dstream_decrypt(struct apfs_dstream_info *dstream,
 		return -EINVAL;
 	default:
 		/*
-		 * A per-file key: those are wrapped by hardware, and the
-		 * catalog records that name them exist only on iOS.  Do not
-		 * hand back ciphertext, and do not pretend a software keybag
-		 * can unwrap them.
+		 * On a single-key volume this is not a key identifier but the
+		 * extent's XTS tweak, which is why Apple keeps writing
+		 * CRYPTO_SW_ID there but the format allows any value.  Anything
+		 * else names a per-file key: those are wrapped by hardware, and
+		 * the catalog records that name them exist only on iOS.
 		 */
+		if (sbi->s_onekey)
+			break;
 		apfs_err(sb, "per-file encryption needs hardware keys (id 0x%llx)",
 			 (unsigned long long)crypto_id);
 		return -EOPNOTSUPP;
