@@ -217,6 +217,14 @@ int __apfs_get_block(struct apfs_dstream_info *dstream, sector_t dsblock,
 
 	ASSERT(!create);
 
+	/*
+	 * The catalog can be read once the keybag is unlocked, but the file-data
+	 * path (and the PFK per-file keys) is not implemented yet. Refuse file
+	 * reads rather than returning ciphertext as if it were file content.
+	 */
+	if (apfs_vol_is_encrypted(sb))
+		return -EOPNOTSUPP;
+
 	if (dsblock >= apfs_size_to_blocks(sb, dstream->ds_size))
 		return 0;
 
