@@ -80,6 +80,7 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 	struct apfs_node *node = NULL;
 	struct apfs_nloc *free_head = NULL;
 	u64 bno;
+	bool decrypted = false;
 	int err;
 
 	switch (storage) {
@@ -130,6 +131,33 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 		return ERR_PTR(-EINVAL);
 	}
 
+	/*
+	 * The catalog tree is the only virtual b-tree in a volume, and on an
+	 * encrypted volume its nodes are AES-XTS encrypted with the volume
+	 * master key. Decrypt into private memory so the page cache keeps the
+	 * on-disk ciphertext and a repeated read cannot decrypt twice.
+	 */
+	if (storage == APFS_OBJ_VIRTUAL && !write && APFS_SB(sb)->s_xts) {
+		void *plain = kmalloc(sb->s_blocksize, GFP_NOFS);
+
+		if (!plain) {
+			brelse(bh);
+			return ERR_PTR(-ENOMEM);
+		}
+		err = apfs_crypto_decrypt(sb, raw, plain,
+					   (u64)bno * sb->s_blocksize / 512,
+					   sb->s_blocksize);
+		if (err) {
+			kfree(plain);
+			brelse(bh);
+			return ERR_PTR(err);
+		}
+		brelse(bh);
+		bh = NULL;
+		raw = plain;
+		decrypted = true;
+	}
+
 	node = kmalloc(sizeof(*node), GFP_KERNEL);
 	if (!node) {
 		brelse(bh);
@@ -154,10 +182,10 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 	node->object.oid = oid;
 	node->object.o_bh = bh;
 	node->object.data = (char *)raw;
-	node->object.ephemeral = !bh;
+	node->object.ephemeral = decrypted ? false : !bh;
 
-	/* Ephemeral objects already got checked on mount */
-	if (!node->object.ephemeral && nxi->nx_flags & APFS_CHECK_NODES && !apfs_obj_verify_csum(sb, bh)) {
+	/* Ephemeral and decrypted objects have no usable on-disk checksum. */
+	if (!node->object.ephemeral && bh && nxi->nx_flags & APFS_CHECK_NODES && !apfs_obj_verify_csum(sb, bh)) {
 		/* TODO: don't check this twice for virtual/physical objects */
 		apfs_err(sb, "bad checksum for node in block 0x%llx", (unsigned long long)bno);
 		apfs_node_free(node);

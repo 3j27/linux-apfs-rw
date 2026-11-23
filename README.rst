@@ -84,6 +84,12 @@ snap=label     Volume snapshot to mount (in read-only mode).
 
 tier2=path     Path to the tier 2 device. For fusion drives only.
 
+password=pass  Unlock a software-encrypted volume with this password. Only
+	       software keybags are supported; hardware (Secure Enclave)
+	       keybags stay locked. Encrypted mounts are read-only and, for
+	       now, only the metadata path is decrypted. Note that mount
+	       options are visible to other users.
+
 uid=n, gid=n   Override on-disk inode ownership data with given uid/gid.
 
 cknodes	       Verify the checksum on all metadata nodes. Right now this has a

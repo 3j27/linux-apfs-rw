@@ -1207,7 +1207,8 @@ static const struct super_operations apfs_sops = {
 };
 
 enum {
-	Opt_readwrite, Opt_cknodes, Opt_uid, Opt_gid, Opt_vol, Opt_snap, Opt_tier2, Opt_err,
+	Opt_readwrite, Opt_cknodes, Opt_uid, Opt_gid, Opt_vol, Opt_snap, Opt_tier2,
+	Opt_password, Opt_err,
 };
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
@@ -1219,6 +1220,7 @@ static const match_table_t tokens = {
 	{Opt_vol, "vol=%u"},
 	{Opt_snap, "snap=%s"},
 	{Opt_tier2, "tier2=%s"},
+	{Opt_password, "password=%s"},
 	{Opt_err, NULL}
 };
 #else
@@ -1230,6 +1232,7 @@ static const struct fs_parameter_spec apfs_param_spec[] = {
 	fsparam_u32	("vol",		Opt_vol),
 	fsparam_string	("snap",	Opt_snap),
 	fsparam_string	("tier2",	Opt_tier2),
+	fsparam_string	("password",	Opt_password),
 	{}
 };
 #endif
@@ -1371,6 +1374,12 @@ static int parse_options(struct apfs_sb_info *sbi, char *options)
 			if (!sbi->s_tier2_path)
 				return -ENOMEM;
 			break;
+		case Opt_password:
+			kfree(sbi->s_password);
+			sbi->s_password = match_strdup(&args[0]);
+			if (!sbi->s_password)
+				return -ENOMEM;
+			break;
 		default:
 			apfs_warn(NULL, "invalid mount option %s", p);
 			return -EINVAL;
@@ -1425,6 +1434,12 @@ static int apfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		kfree(sbi->s_tier2_path);
 		sbi->s_tier2_path = kstrdup(param->string, GFP_KERNEL);
 		if (!sbi->s_tier2_path)
+			return -ENOMEM;
+		break;
+	case Opt_password:
+		kfree(sbi->s_password);
+		sbi->s_password = kstrdup(param->string, GFP_KERNEL);
+		if (!sbi->s_password)
 			return -ENOMEM;
 		break;
 	default:
@@ -1530,8 +1545,11 @@ static int apfs_check_vol_features(struct super_block *sb)
 		return -EINVAL;
 	}
 	if (features & APFS_INCOMPAT_PFK) {
-		apfs_warn(sb, "PFK is not supported");
-		return -EINVAL;
+		if (!apfs_crypto_ready(sb)) {
+			apfs_warn(sb, "PFK volumes need a software keybag and a password");
+			return -EINVAL;
+		}
+		apfs_warn(sb, "PFK volume: metadata reads only for now");
 	}
 	if (features & APFS_INCOMPAT_SECONDARY_FSROOT) {
 		apfs_warn(sb, "secondary fsroot is not supported");
@@ -1556,9 +1574,14 @@ static int apfs_check_vol_features(struct super_block *sb)
 		apfs_warn(sb, "extent prealloc flag is set");
 
 	features = le64_to_cpu(vsb_raw->apfs_fs_flags);
-	/* Some encrypted volumes are readable anyway */
-	if (!(features & APFS_FS_UNENCRYPTED))
-		apfs_warn(sb, "volume is encrypted, may not be read correctly");
+	if (!(features & APFS_FS_UNENCRYPTED)) {
+		if (!apfs_crypto_ready(sb)) {
+			apfs_warn(sb, "encrypted volume: supply password= to unlock the keybag");
+			return -EINVAL;
+		}
+		sb->s_flags |= SB_RDONLY;
+		apfs_info(sb, "encrypted volume: metadata reads only for now");
+	}
 
 	features = le64_to_cpu(vsb_raw->apfs_readonly_compatible_features);
 	if (features & ~APFS_SUPPORTED_ROCOMPAT_MASK) {
@@ -1668,6 +1691,16 @@ static int apfs_fill_super(struct super_block *sb, void *data, int silent)
 	err = apfs_map_volume_super(sb, false /* write */);
 	if (err)
 		goto failed_volume;
+
+	if (apfs_vol_is_encrypted(sb) && sbi->s_password) {
+		err = apfs_crypto_unlock(sb, sbi->s_password);
+		kfree(sbi->s_password);
+		sbi->s_password = NULL;
+		if (err) {
+			apfs_err(sb, "unable to unlock volume keybag: %d", err);
+			goto failed_omap;
+		}
+	}
 
 	err = apfs_check_vol_features(sb);
 	if (err)
@@ -2161,6 +2194,9 @@ static void apfs_free_sb_info(struct super_block *sb)
 	sbi->s_snap_name = NULL;
 	kfree(sbi->s_tier2_path);
 	sbi->s_tier2_path = NULL;
+	apfs_crypto_free(sbi);
+	kfree(sbi->s_password);
+	sbi->s_password = NULL;
 	if (sbi->s_dflt_pfk)
 		kfree(sbi->s_dflt_pfk);
 	kfree(sbi);
@@ -2213,6 +2249,8 @@ static void apfs_free_fc(struct fs_context *fc)
 		apfs_free_main_super(sbi);
 		kfree(sbi->s_snap_name);
 		kfree(sbi->s_tier2_path);
+		apfs_crypto_free(sbi);
+		kfree(sbi->s_password);
 		kfree(sbi);
 	}
 }
