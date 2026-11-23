@@ -17,6 +17,7 @@
 #include <linux/unaligned.h>
 #include <linux/minmax.h>
 #include <linux/scatterlist.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 
 #include "apfs.h"
@@ -275,7 +276,7 @@ static int apfs_sha256(const u8 *data, unsigned int len, u8 out[32])
 
 static int apfs_aes_kw_unwrap(const u8 *kek, unsigned int kek_len,
 			      const u8 *wrapped, unsigned int wrapped_len,
-			      u8 *out)
+			      u8 *out, unsigned int out_len)
 {
 	struct crypto_skcipher *tfm;
 	struct skcipher_request *req;
@@ -284,12 +285,20 @@ static int apfs_aes_kw_unwrap(const u8 *kek, unsigned int kek_len,
 	unsigned int n, j;
 	int i, err = 0;
 
-	if (wrapped_len < 16 || (wrapped_len & 7) || wrapped_len > 40)
+	if (wrapped_len < 16 || (wrapped_len & 7))
+		return -EINVAL;
+	if (wrapped_len > out_len || wrapped_len > APFS_CP_MAX_WRAPPEDKEYSIZE)
 		return -EINVAL;
 	if (kek_len != 16 && kek_len != 32)
 		return -EINVAL;
 
-	n = wrapped_len / 8;
+	/*
+	 * RFC 3394 counts the wrapped payload in 64-bit blocks (n of them,
+	 * plus one more block for the integrity vector) and the key-wrap
+	 * counter runs t = n*j + i.  Using the ciphertext block count here
+	 * would throw the counter off by one block per round.
+	 */
+	n = wrapped_len / 8 - 1;
 	memcpy(out, wrapped, wrapped_len);
 
 	tfm = crypto_alloc_skcipher("ecb(aes)", 0, 0);
@@ -305,7 +314,7 @@ static int apfs_aes_kw_unwrap(const u8 *kek, unsigned int kek_len,
 	}
 
 	for (j = 6; j-- > 0; ) {
-		for (i = n - 1; i >= 1; i--) {
+		for (i = n; i >= 1; i--) {
 			u64 t = (u64)n * j + i;
 			u64 a;
 
@@ -455,7 +464,7 @@ static int apfs_kek_unwrap(const struct apfs_kek *kek, const u8 *unwrap_key,
 		return -EINVAL;
 
 	err = apfs_aes_kw_unwrap(unwrap_key, unwrap_key_len, kek->wrapped,
-				 kek->wrapped_len, unwrapped);
+				 kek->wrapped_len, unwrapped, sizeof(unwrapped));
 	if (err)
 		return err;
 
@@ -715,11 +724,245 @@ out:
 	return err;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Per-file keys (PFK)                                                       */
+
+/*
+ * A per-file key, unwrapped from a crypto state record and kept until the
+ * volume is unmounted.  The record is keyed by the crypto identifier that the
+ * file's extents carry, so one entry serves every extent that names it.
+ */
+struct apfs_pfk {
+	struct list_head	pfk_list;
+	u64			pfk_crypto_id;
+	struct crypto_skcipher	*pfk_tfm;
+};
+
+/**
+ * apfs_pfk_build - Unwrap the per-file key named by a crypto identifier
+ * @sb:		filesystem superblock
+ * @crypto_id:	crypto identifier carried by the file's extents
+ *
+ * Finds the crypto state record (a D record keyed by @crypto_id), unwraps the
+ * key it holds with the volume master key, and returns an XTS transform for
+ * that key.  Returns an ERR_PTR in case of failure.
+ */
+static struct crypto_skcipher *apfs_pfk_build(struct super_block *sb, u64 crypto_id)
+{
+	struct apfs_sb_info *sbi = APFS_SB(sb);
+	struct apfs_crypto_state_val *raw_val;
+	struct crypto_skcipher *tfm = NULL;
+	struct apfs_query *query;
+	unsigned int key_len, plain_len;
+	u8 *unwrapped;
+	int err;
+
+	query = apfs_alloc_query(sbi->s_cat_root, NULL /* parent */);
+	if (!query)
+		return ERR_PTR(-ENOMEM);
+	apfs_init_crypto_state_key(crypto_id, &query->key);
+	query->flags |= APFS_QUERY_CAT | APFS_QUERY_EXACT;
+
+	err = apfs_btree_query(sb, &query);
+	if (err) {
+		if (err == -ENODATA)
+			err = -EINVAL;
+		apfs_err(sb, "crypto state query failed for id 0x%llx", crypto_id);
+		apfs_free_query(query);
+		return ERR_PTR(err);
+	}
+
+	raw_val = (void *)query->node->object.data + query->off;
+	if (query->len < (int)sizeof(*raw_val)) {
+		apfs_err(sb, "crypto state record 0x%llx is too small", crypto_id);
+		apfs_free_query(query);
+		return ERR_PTR(-EFSCORRUPTED);
+	}
+	key_len = le16_to_cpu(raw_val->state.key_len);
+	if (query->len != (int)sizeof(*raw_val) + key_len ||
+	    key_len > APFS_CP_MAX_WRAPPEDKEYSIZE) {
+		apfs_err(sb, "bad wrapped key length (%u) in crypto state 0x%llx",
+			 key_len, crypto_id);
+		apfs_free_query(query);
+		return ERR_PTR(-EFSCORRUPTED);
+	}
+	/* The reference allows a record without a key: the volume key applies */
+	if (!key_len) {
+		apfs_free_query(query);
+		return ERR_PTR(-ENODATA);
+	}
+
+	unwrapped = kmalloc(key_len, GFP_KERNEL);
+	if (!unwrapped) {
+		apfs_free_query(query);
+		return ERR_PTR(-ENOMEM);
+	}
+	err = apfs_aes_kw_unwrap(sbi->s_master_key, sbi->s_master_key_len,
+				 raw_val->state.persistent_key, key_len,
+				 unwrapped, key_len);
+	if (err)
+		goto out;
+	/* RFC 3394 leaves the integrity vector in the first eight bytes */
+	if (get_unaligned_be64(unwrapped) != 0xa6a6a6a6a6a6a6a6ULL) {
+		apfs_err(sb, "crypto state 0x%llx is not wrapped by this volume",
+			 crypto_id);
+		err = -EINVAL;
+		goto out;
+	}
+	plain_len = key_len - 8;
+	if (plain_len != 32 && plain_len != 64) {
+		apfs_err(sb, "unexpected per-file key size (%u)", plain_len);
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
+	tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
+	if (IS_ERR(tfm)) {
+		err = PTR_ERR(tfm);
+		tfm = NULL;
+		goto out;
+	}
+	err = crypto_skcipher_setkey(tfm, unwrapped + 8, plain_len);
+	if (err) {
+		crypto_free_skcipher(tfm);
+		tfm = NULL;
+	}
+
+out:
+	memzero_explicit(unwrapped, key_len);
+	kfree(unwrapped);
+	apfs_free_query(query);
+	if (err)
+		return ERR_PTR(err);
+	return tfm;
+}
+
+/**
+ * apfs_pfk_get - Find or build the transform for one crypto identifier
+ * @sb:		filesystem superblock
+ * @crypto_id:	crypto identifier carried by the file's extents
+ *
+ * The identifier is global to the volume, not to the file, so the cache is
+ * shared by every inode.  Returns the transform, or an ERR_PTR.
+ */
+static struct crypto_skcipher *apfs_pfk_get(struct super_block *sb, u64 crypto_id)
+{
+	struct apfs_sb_info *sbi = APFS_SB(sb);
+	struct apfs_pfk *pfk;
+	struct crypto_skcipher *tfm;
+
+	mutex_lock(&sbi->s_pfk_lock);
+	list_for_each_entry(pfk, &sbi->s_pfk_list, pfk_list) {
+		if (pfk->pfk_crypto_id == crypto_id) {
+			tfm = pfk->pfk_tfm;
+			goto out;
+		}
+	}
+
+	tfm = apfs_pfk_build(sb, crypto_id);
+	if (!IS_ERR(tfm)) {
+		pfk = kmalloc(sizeof(*pfk), GFP_KERNEL);
+		if (!pfk) {
+			crypto_free_skcipher(tfm);
+			tfm = ERR_PTR(-ENOMEM);
+		} else {
+			pfk->pfk_crypto_id = crypto_id;
+			pfk->pfk_tfm = tfm;
+			list_add_tail(&pfk->pfk_list, &sbi->s_pfk_list);
+		}
+	}
+out:
+	mutex_unlock(&sbi->s_pfk_lock);
+	return tfm;
+}
+
+/**
+ * apfs_dstream_decrypt - Decrypt one block of a data stream
+ * @dstream:	data stream the block belongs to
+ * @ext:	the extent record that holds the block
+ * @blk_off:	offset of the block within the extent, in blocks
+ * @src:	ciphertext, one or more blocks
+ * @dst:	where to put the plaintext (may be NULL to mean @src)
+ * @len:	number of bytes, a multiple of 512
+ *
+ * The crypto identifier of the extent says which key decrypts the extent: one
+ * of the reserved identifiers means the data is in the clear or uses the
+ * volume key, and anything else names a crypto state record with a per-file
+ * key.  The tweak is the crypto identifier plus the block's offset within the
+ * extent, measured in 512-byte sectors like every other XTS tweak here.
+ *
+ * Returns 0 on success or a negative error code in case of failure.
+ */
+int apfs_dstream_decrypt(struct apfs_dstream_info *dstream,
+			 const struct apfs_file_extent *ext, u64 blk_off,
+			 const void *src, void *dst, size_t len)
+{
+	struct super_block *sb = dstream->ds_sb;
+	struct apfs_sb_info *sbi = APFS_SB(sb);
+	struct crypto_skcipher *tfm = sbi->s_xts;
+	u64 crypto_id = ext->crypto_id;
+	u64 tweak;
+
+	if (!dst)
+		dst = (void *)src;
+	if (!tfm)
+		return -EOPNOTSUPP;
+	if (len & 511)
+		return -EINVAL;
+
+	switch (crypto_id) {
+	case APFS_CRYPTO_NULL:
+	case APFS_CRYPTO_UNENCRYPTED:
+	case APFS_CRYPTO_SPARSE_BUNDLE:
+		/* Stored in the clear even on a volume that is otherwise keys */
+		memcpy(dst, src, len);
+		return 0;
+	case APFS_CRYPTO_SW_RAW:
+	case APFS_CRYPTO_SW_ID:
+		break;	/* the volume key encrypts this extent */
+	case APFS_UNASSIGNED_CRYPTO_ID:
+		return -EINVAL;
+	default:
+		if (sbi->s_onekey)
+			break;	/* the volume key encrypts every file */
+		{
+			struct crypto_skcipher *pfk = apfs_pfk_get(sb, crypto_id);
+
+			if (IS_ERR(pfk)) {
+				/* A crypto state record without a key means
+				 * the volume key applies; anything else is a
+				 * real failure. */
+				if (PTR_ERR(pfk) != -ENODATA)
+					return PTR_ERR(pfk);
+			} else
+				tfm = pfk;
+		}
+		break;
+	}
+
+	tweak = (crypto_id + blk_off) * (sb->s_blocksize / 512);
+	return apfs_xts_crypt(tfm, src, dst, tweak, len, false);
+}
+
+void apfs_crypto_init(struct apfs_sb_info *sbi)
+{
+	INIT_LIST_HEAD(&sbi->s_pfk_list);
+	mutex_init(&sbi->s_pfk_lock);
+}
+
 void apfs_crypto_free(struct apfs_sb_info *sbi)
 {
+	struct apfs_pfk *pfk;
+	struct apfs_pfk *next;
+
 	if (sbi->s_xts) {
 		crypto_free_skcipher(sbi->s_xts);
 		sbi->s_xts = NULL;
+	}
+	list_for_each_entry_safe(pfk, next, &sbi->s_pfk_list, pfk_list) {
+		crypto_free_skcipher(pfk->pfk_tfm);
+		list_del(&pfk->pfk_list);
+		kfree(pfk);
 	}
 	if (sbi->s_master_key) {
 		memzero_explicit(sbi->s_master_key, sbi->s_master_key_len);

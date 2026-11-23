@@ -357,6 +357,7 @@ struct apfs_omap_map {
 struct apfs_omap_rec {
 	u64 oid;
 	u64 bno;
+	u32 flags;	/* The omap record's flags, for APFS_OMAP_VAL_* */
 };
 
 #define APFS_OMAP_CACHE_SLOTS		128
@@ -418,6 +419,9 @@ struct apfs_sb_info {
 	u8 *s_master_key;		/* unwrapped volume master key */
 	unsigned int s_master_key_len;
 	struct crypto_skcipher *s_xts;	/* XTS transform for volume data */
+	bool s_onekey;			/* every file uses the volume key */
+	struct list_head s_pfk_list;	/* Cached per-file key transforms */
+	struct mutex s_pfk_lock;	/* Protects s_pfk_list */
 
 	struct inode *s_private_dir;	/* Inode for the private directory */
 	struct work_struct s_orphan_cleanup_work;
@@ -955,6 +959,7 @@ extern struct apfs_query *apfs_alloc_query(struct apfs_node *node,
 extern void apfs_free_query(struct apfs_query *query);
 extern int apfs_btree_query(struct super_block *sb, struct apfs_query **query);
 extern int apfs_omap_lookup_block(struct super_block *sb, struct apfs_omap *omap, u64 id, u64 *block, bool write);
+extern int apfs_omap_lookup_block_flags(struct super_block *sb, struct apfs_omap *omap, u64 id, u64 *block, u32 *flags, bool write);
 extern int apfs_omap_lookup_newest_block(struct super_block *sb, struct apfs_omap *omap, u64 id, u64 *block, bool write);
 
 /* Software encryption: keybag unlock and XTS helpers (crypto.c) */
@@ -963,6 +968,12 @@ extern void apfs_crypto_free(struct apfs_sb_info *sbi);
 extern int apfs_crypto_decrypt(struct super_block *sb, const void *src,
 			       void *dst, u64 sector, size_t len);
 extern bool apfs_crypto_ready(struct super_block *sb);
+extern int apfs_dstream_decrypt(struct apfs_dstream_info *dstream,
+				const struct apfs_file_extent *ext, u64 blk_off,
+				const void *src, void *dst, size_t len);
+extern int apfs_read_dstream_folio(struct apfs_dstream_info *dstream,
+				   struct folio *folio, size_t len);
+extern void apfs_crypto_init(struct apfs_sb_info *sbi);
 extern int apfs_create_omap_rec(struct super_block *sb, u64 oid, u64 bno);
 extern int apfs_delete_omap_rec(struct super_block *sb, u64 oid);
 extern int apfs_query_join_transaction(struct apfs_query *query);

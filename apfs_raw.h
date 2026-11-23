@@ -1171,8 +1171,16 @@ struct apfs_modified_by {
 #define APFS_PROTECTION_CLASS_D		4 /* No protection */
 #define APFS_PROTECTION_CLASS_F		6 /* No protection, nonpersistent key */
 
-/* Encryption identifiers */
-#define APFS_CRYPTO_SW_ID		4
+/*
+ * Encryption identifiers. The first four name a handling policy rather than a
+ * key, and only APFS_CRYPTO_SW_ID asks for software encryption with the volume
+ * key; anything else is the object id of a crypto state record.
+ */
+#define APFS_CRYPTO_NULL		0 /* no key: stored in the clear */
+#define APFS_CRYPTO_SW_RAW		1 /* software, unwrapped key (unused) */
+#define APFS_CRYPTO_UNENCRYPTED		2 /* hardware: stored in the clear */
+#define APFS_CRYPTO_SPARSE_BUNDLE	3 /* hardware: sparse image */
+#define APFS_CRYPTO_SW_ID		4 /* software: the volume key */
 #define APFS_CRYPTO_RESERVED_5		5
 #define APFS_UNASSIGNED_CRYPTO_ID	(~0ULL)
 

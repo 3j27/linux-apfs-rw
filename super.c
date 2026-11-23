@@ -1287,6 +1287,7 @@ static void apfs_set_default_opts(struct apfs_sb_info *sbi)
 	sbi->s_snap_name = NULL;
 	sbi->s_tier2_path = NULL;
 	sbi->s_mount_opt = 0;
+	apfs_crypto_init(sbi);
 #ifdef CONFIG_APFS_RW_ALWAYS
 	/* Still risky, but some packagers want writable mounts by default */
 	sbi->s_mount_opt |= APFS_READWRITE;
@@ -1549,7 +1550,7 @@ static int apfs_check_vol_features(struct super_block *sb)
 			apfs_warn(sb, "PFK volumes need a software keybag and a password");
 			return -EINVAL;
 		}
-		apfs_warn(sb, "PFK volume: metadata reads only for now");
+		apfs_info(sb, "PFK volume: per-file keys will be unwrapped on demand");
 	}
 	if (features & APFS_INCOMPAT_SECONDARY_FSROOT) {
 		apfs_warn(sb, "secondary fsroot is not supported");
@@ -1579,8 +1580,21 @@ static int apfs_check_vol_features(struct super_block *sb)
 			apfs_warn(sb, "encrypted volume: supply password= to unlock the keybag");
 			return -EINVAL;
 		}
+		if (le64_to_cpu(vsb_raw->apfs_incompatible_features) &
+		    APFS_INCOMPAT_SEALED_VOLUME) {
+			/*
+			 * A sealed volume keeps its extents in the file extent
+			 * tree, and those records carry no crypto identifier:
+			 * there would be no way to tell which key encrypts a
+			 * block.  Refuse rather than hand back ciphertext.
+			 */
+			apfs_warn(sb, "sealed encrypted volumes are not supported");
+			return -EINVAL;
+		}
 		sb->s_flags |= SB_RDONLY;
-		apfs_info(sb, "encrypted volume: metadata reads only for now");
+		APFS_SB(sb)->s_onekey = features & APFS_FS_ONEKEY;
+		apfs_info(sb, "encrypted volume: keybag unlocked, %s keys",
+			  APFS_SB(sb)->s_onekey ? "volume" : "per-file");
 	}
 
 	features = le64_to_cpu(vsb_raw->apfs_readonly_compatible_features);

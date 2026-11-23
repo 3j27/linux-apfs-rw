@@ -64,10 +64,12 @@ static int apfs_child_from_query(struct apfs_query *query, u64 *child)
  * @omap:	the object map
  * @oid:	object id to look up
  * @bno:	on return, the block number for the oid
+ * @flags:	on return, the record's flags (NULL if not wanted)
  *
  * Returns 0 on success, or -1 if this mapping is not cached.
  */
-static int apfs_omap_cache_lookup(struct apfs_omap *omap, u64 oid, u64 *bno)
+static int apfs_omap_cache_lookup(struct apfs_omap *omap, u64 oid, u64 *bno,
+				  u32 *flags)
 {
 	struct apfs_omap_cache *cache = &omap->omap_cache;
 	struct apfs_omap_rec *record = NULL;
@@ -87,6 +89,8 @@ static int apfs_omap_cache_lookup(struct apfs_omap *omap, u64 oid, u64 *bno)
 	spin_lock(&cache->lock);
 	if (record->oid == oid) {
 		*bno = record->bno;
+		if (flags)
+			*flags = record->flags;
 		ret = 0;
 	}
 	spin_unlock(&cache->lock);
@@ -99,8 +103,10 @@ static int apfs_omap_cache_lookup(struct apfs_omap *omap, u64 oid, u64 *bno)
  * @omap:	the object map
  * @oid:	object id of the record
  * @bno:	block number for the oid
+ * @flags:	flags of the omap record (0 if none)
  */
-static void apfs_omap_cache_save(struct apfs_omap *omap, u64 oid, u64 bno)
+static void apfs_omap_cache_save(struct apfs_omap *omap, u64 oid, u64 bno,
+				 u32 flags)
 {
 	struct apfs_omap_cache *cache = &omap->omap_cache;
 	struct apfs_omap_rec *record = NULL;
@@ -115,6 +121,7 @@ static void apfs_omap_cache_save(struct apfs_omap *omap, u64 oid, u64 bno)
 	spin_lock(&cache->lock);
 	record->oid = oid;
 	record->bno = bno;
+	record->flags = flags;
 	spin_unlock(&cache->lock);
 }
 
@@ -176,12 +183,13 @@ static inline bool apfs_xid_in_snapshot(struct apfs_omap *omap, u64 xid)
  * @id:		id of the node
  * @xid:	transaction id
  * @block:	on return, the found block number
+ * @flags:	on return, the record's flags (NULL if not wanted)
  * @write:	get write access to the object?
  *
  * Searches @omap for the most recent matching object with a transaction id
  * below @xid. Returns 0 on success or a negative error code in case of failure.
  */
-static int apfs_omap_lookup_block_with_xid(struct super_block *sb, struct apfs_omap *omap, u64 id, u64 xid, u64 *block, bool write)
+static int apfs_omap_lookup_block_with_xid(struct super_block *sb, struct apfs_omap *omap, u64 id, u64 xid, u64 *block, u32 *flags, bool write)
 {
 	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
 	struct apfs_query *query;
@@ -189,7 +197,7 @@ static int apfs_omap_lookup_block_with_xid(struct super_block *sb, struct apfs_o
 	int ret = 0;
 
 	if (!write) {
-		if (!apfs_omap_cache_lookup(omap, id, block))
+		if (!apfs_omap_cache_lookup(omap, id, block, flags))
 			return 0;
 	}
 
@@ -213,6 +221,8 @@ static int apfs_omap_lookup_block_with_xid(struct super_block *sb, struct apfs_o
 		goto fail;
 	}
 	*block = map.bno;
+	if (flags)
+		*flags = map.flags;
 
 	if (write) {
 		struct apfs_omap_key key;
@@ -246,7 +256,7 @@ static int apfs_omap_lookup_block_with_xid(struct super_block *sb, struct apfs_o
 		brelse(new_bh);
 	}
 
-	apfs_omap_cache_save(omap, id, *block);
+	apfs_omap_cache_save(omap, id, *block, map.flags);
 
 fail:
 	apfs_free_query(query);
@@ -265,7 +275,28 @@ fail:
  */
 int apfs_omap_lookup_block(struct super_block *sb, struct apfs_omap *omap, u64 id, u64 *block, bool write)
 {
-	return apfs_omap_lookup_block_with_xid(sb, omap, id, apfs_mounted_xid(sb), block, write);
+	return apfs_omap_lookup_block_with_xid(sb, omap, id, apfs_mounted_xid(sb), block, NULL, write);
+}
+
+/**
+ * apfs_omap_lookup_block_flags - Like apfs_omap_lookup_block(), with flags
+ * @sb:		filesystem superblock
+ * @omap:	object map to be searched
+ * @id:		id of the node
+ * @block:	on return, the found block number
+ * @flags:	on return, the flags of the omap record
+ * @write:	get write access to the object?
+ *
+ * The omap record says whether the object it maps is encrypted
+ * (APFS_OMAP_VAL_ENCRYPTED), which is the only way a reader of an encrypted
+ * volume can tell a node it must decrypt from one that is in the clear.
+ *
+ * Returns 0 on success or a negative error code in case of failure.
+ */
+int apfs_omap_lookup_block_flags(struct super_block *sb, struct apfs_omap *omap,
+				 u64 id, u64 *block, u32 *flags, bool write)
+{
+	return apfs_omap_lookup_block_with_xid(sb, omap, id, apfs_mounted_xid(sb), block, flags, write);
 }
 
 /**
@@ -280,7 +311,7 @@ int apfs_omap_lookup_block(struct super_block *sb, struct apfs_omap *omap, u64 i
  */
 int apfs_omap_lookup_newest_block(struct super_block *sb, struct apfs_omap *omap, u64 id, u64 *block, bool write)
 {
-	return apfs_omap_lookup_block_with_xid(sb, omap, id, -1, block, write);
+	return apfs_omap_lookup_block_with_xid(sb, omap, id, -1, block, NULL, write);
 }
 
 /**
@@ -326,7 +357,7 @@ int apfs_create_omap_rec(struct super_block *sb, u64 oid, u64 bno)
 		goto fail;
 	}
 
-	apfs_omap_cache_save(omap, oid, bno);
+	apfs_omap_cache_save(omap, oid, bno, 0);
 
 fail:
 	apfs_free_query(query);

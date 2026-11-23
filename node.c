@@ -80,13 +80,15 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 	struct apfs_node *node = NULL;
 	struct apfs_nloc *free_head = NULL;
 	u64 bno;
+	u32 omap_flags = 0;
 	bool decrypted = false;
 	int err;
 
 	switch (storage) {
 	case APFS_OBJ_VIRTUAL:
 		/* All virtual nodes are inside a volume, at least for now */
-		err = apfs_omap_lookup_block(sb, sbi->s_omap, oid, &bno, write);
+		err = apfs_omap_lookup_block_flags(sb, sbi->s_omap, oid, &bno,
+						   &omap_flags, write);
 		if (err) {
 			apfs_err(sb, "omap lookup failed for oid 0x%llx", oid);
 			return ERR_PTR(err);
@@ -132,12 +134,14 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 	}
 
 	/*
-	 * The catalog tree is the only virtual b-tree in a volume, and on an
-	 * encrypted volume its nodes are AES-XTS encrypted with the volume
-	 * master key. Decrypt into private memory so the page cache keeps the
-	 * on-disk ciphertext and a repeated read cannot decrypt twice.
+	 * The object map says whether a virtual object is encrypted; on an
+	 * encrypted volume the catalog nodes are, and they are read with the
+	 * volume key and the physical block number as the XTS tweak.  Decrypt
+	 * into private memory, so the buffer cache keeps the on-disk
+	 * ciphertext and a repeated read cannot decrypt twice.
 	 */
-	if (storage == APFS_OBJ_VIRTUAL && !write && APFS_SB(sb)->s_xts) {
+	if (storage == APFS_OBJ_VIRTUAL && !write &&
+	    (omap_flags & APFS_OMAP_VAL_ENCRYPTED)) {
 		void *plain = kmalloc(sb->s_blocksize, GFP_NOFS);
 
 		if (!plain) {

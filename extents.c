@@ -6,6 +6,8 @@
 #include <linux/buffer_head.h>
 #include <linux/slab.h>
 #include <linux/blk_types.h>
+#include <linux/highmem.h>
+#include <linux/pagemap.h>
 #include "apfs.h"
 
 /**
@@ -218,9 +220,10 @@ int __apfs_get_block(struct apfs_dstream_info *dstream, sector_t dsblock,
 	ASSERT(!create);
 
 	/*
-	 * The catalog can be read once the keybag is unlocked, but the file-data
-	 * path (and the PFK per-file keys) is not implemented yet. Refuse file
-	 * reads rather than returning ciphertext as if it were file content.
+	 * Mapping a block of an encrypted volume is pointless without the
+	 * decryption that apfs_read_dstream_folio() does: every caller of this
+	 * one would put ciphertext in the page cache.  Refuse the request
+	 * instead of pretending the read succeeded.
 	 */
 	if (apfs_vol_is_encrypted(sb))
 		return -EOPNOTSUPP;
@@ -268,6 +271,105 @@ int apfs_get_block(struct inode *inode, sector_t iblock,
 	ret = __apfs_get_block(&ai->i_dstream, iblock, bh_result, create);
 	up_read(&nxi->nx_big_sem);
 	return ret;
+}
+
+/**
+ * apfs_read_dstream_folio - Read a folio of an encrypted data stream
+ * @dstream:	data stream info
+ * @folio:	folio to fill, from its start, with @len bytes
+ * @len:	number of bytes to fill
+ *
+ * The generic block read path cannot decrypt: it hands buffer heads straight
+ * to the block layer, so the page cache would end up holding ciphertext.  On
+ * an encrypted volume each block is read on its own instead, decrypted into
+ * private memory, and copied into the folio.  That costs the merged read, and
+ * only happens on encrypted volumes.
+ *
+ * The folio must be locked by the caller.  Returns 0 on success, or a negative
+ * error code in case of failure; on failure the folio is not uptodate.
+ */
+int apfs_read_dstream_folio(struct apfs_dstream_info *dstream,
+			    struct folio *folio, size_t len)
+{
+	struct inode *inode = folio->mapping->host;
+	struct super_block *sb = inode->i_sb;
+	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
+	loff_t pos = folio_pos(folio);
+	loff_t isize = i_size_read(inode);
+	unsigned int blocksize = sb->s_blocksize;
+	unsigned int off = 0;
+	void *kaddr;
+	int err = 0;
+
+	if (pos >= isize) {
+		folio_zero_range(folio, 0, len);
+		return 0;
+	}
+
+	kaddr = kmap_local_folio(folio, 0);
+	down_read(&nxi->nx_big_sem);
+	while (off < len) {
+		loff_t start = pos + off;
+		size_t remain = len - off;
+		unsigned int tail = blocksize - (start & (loff_t)(blocksize - 1));
+		struct apfs_file_extent ext;
+		struct buffer_head *bh;
+		void *plain;
+		u64 blk_off;
+		unsigned int chunk;
+
+		if (start >= isize) {		/* Past the end: zero the rest */
+			memset(kaddr + off, 0, remain);
+			break;
+		}
+		if (remain > tail)
+			remain = tail;
+		if (start + remain > isize)
+			remain = isize - start;
+		chunk = remain;
+
+		err = apfs_extent_read(dstream, start >> sb->s_blocksize_bits,
+				       &ext);
+		if (err)
+			break;
+
+		if (apfs_ext_is_hole(&ext)) {
+			memset(kaddr + off, 0, chunk);
+			off += chunk;
+			continue;
+		}
+
+		blk_off = (start >> sb->s_blocksize_bits) -
+			  (ext.logical_addr >> sb->s_blocksize_bits);
+		bh = apfs_sb_bread(sb, ext.phys_block_num + blk_off);
+		if (!bh) {
+			apfs_err(sb, "failed to read block for ino 0x%llx",
+				 apfs_ino(inode));
+			err = -EIO;
+			break;
+		}
+		plain = kmalloc(blocksize, GFP_NOFS);
+		if (!plain) {
+			brelse(bh);
+			err = -ENOMEM;
+			break;
+		}
+		err = apfs_dstream_decrypt(dstream, &ext, blk_off, bh->b_data,
+					   plain, blocksize);
+		brelse(bh);
+		if (!err)
+			memcpy(kaddr + off, plain, chunk);
+		kfree(plain);
+		if (err) {
+			apfs_err(sb, "failed to decrypt block for ino 0x%llx",
+				 apfs_ino(inode));
+			break;
+		}
+		off += chunk;
+	}
+	up_read(&nxi->nx_big_sem);
+	kunmap_local(kaddr);
+	return err;
 }
 
 /**
@@ -2341,7 +2443,42 @@ int apfs_nonsparse_dstream_read(struct apfs_dstream_info *dstream, void *buf, si
 		else
 			left_in_block = sb->s_blocksize - off_in_block;
 
-		memcpy(buf, bhs[idx]->b_data + off_in_block, left_in_block);
+		if (apfs_vol_is_encrypted(sb)) {
+			struct apfs_file_extent ext;
+			void *plain;
+
+			/*
+			 * The buffer cache holds what the disk holds, so the
+			 * decryption has to happen on the way out, into a
+			 * private buffer.  The extent record names the key.
+			 */
+			plain = kmalloc(sb->s_blocksize, GFP_NOFS);
+			if (!plain) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			ret = apfs_extent_read(dstream, log_bno, &ext);
+			if (!ret) {
+				if (apfs_ext_is_hole(&ext)) {
+					apfs_err(sb, "nonsparse dstream has a hole");
+					ret = -EFSCORRUPTED;
+				} else {
+					u64 blk_off = log_bno -
+						(ext.logical_addr >> sb->s_blocksize_bits);
+
+					ret = apfs_dstream_decrypt(dstream, &ext,
+								   blk_off, bhs[idx]->b_data,
+								   plain, sb->s_blocksize);
+				}
+				if (!ret)
+					memcpy(buf, plain + off_in_block, left_in_block);
+			}
+			kfree(plain);
+			if (ret)
+				goto out;
+		} else {
+			memcpy(buf, bhs[idx]->b_data + off_in_block, left_in_block);
+		}
 		buf += left_in_block;
 	}
 

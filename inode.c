@@ -6,7 +6,9 @@
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
 #include <linux/mount.h>
+#include <linux/highmem.h>
 #include <linux/mpage.h>
+#include <linux/pagemap.h>
 #include <linux/blk_types.h>
 #include "apfs.h"
 
@@ -31,6 +33,19 @@ static struct page *grab_cache_page_write_begin(struct address_space *mapping, p
 
 static int apfs_read_folio(struct file *file, struct folio *folio)
 {
+	struct inode *inode = folio->mapping->host;
+
+	/* An encrypted volume needs the block-by-block path in extents.c */
+	if (apfs_vol_is_encrypted(inode->i_sb)) {
+		int err = apfs_read_dstream_folio(&APFS_I(inode)->i_dstream,
+						  folio, folio_size(folio));
+
+		if (!err)
+			folio_mark_uptodate(folio);
+		folio_unlock(folio);
+		return err;
+	}
+
 	return mpage_read_folio(folio, apfs_get_block);
 }
 
@@ -38,6 +53,18 @@ static int apfs_read_folio(struct file *file, struct folio *folio)
 
 static int apfs_readpage(struct file *file, struct page *page)
 {
+	struct inode *inode = page->mapping->host;
+
+	if (apfs_vol_is_encrypted(inode->i_sb)) {
+		int err = apfs_read_dstream_folio(&APFS_I(inode)->i_dstream,
+						  page_folio(page), PAGE_SIZE);
+
+		if (!err)
+			SetPageUptodate(page);
+		unlock_page(page);
+		return err;
+	}
+
 	return mpage_readpage(page, apfs_get_block);
 }
 
@@ -47,7 +74,21 @@ static int apfs_readpage(struct file *file, struct page *page)
 
 static void apfs_readahead(struct readahead_control *rac)
 {
-	mpage_readahead(rac, apfs_get_block);
+	struct inode *inode = rac->mapping->host;
+	struct folio *folio;
+
+	if (!apfs_vol_is_encrypted(inode->i_sb)) {
+		mpage_readahead(rac, apfs_get_block);
+		return;
+	}
+
+	/* The merged read of mpage_readahead() cannot decrypt */
+	while ((folio = readahead_folio(rac))) {
+		if (!apfs_read_dstream_folio(&APFS_I(inode)->i_dstream, folio,
+					     folio_size(folio)))
+			folio_mark_uptodate(folio);
+		folio_unlock(folio);
+	}
 }
 
 #else /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0) */
@@ -55,7 +96,20 @@ static void apfs_readahead(struct readahead_control *rac)
 static int apfs_readpages(struct file *file, struct address_space *mapping,
 			  struct list_head *pages, unsigned int nr_pages)
 {
-	return mpage_readpages(mapping, pages, nr_pages, apfs_get_block);
+	struct inode *inode = mapping->host;
+	struct page *page;
+
+	if (!apfs_vol_is_encrypted(inode->i_sb))
+		return mpage_readpages(mapping, pages, nr_pages,
+				       apfs_get_block);
+
+	/* The merged read of mpage_readpages() cannot decrypt */
+	list_for_each_entry(page, pages, lru) {
+		if (!apfs_read_dstream_folio(&APFS_I(inode)->i_dstream,
+					     page_folio(page), PAGE_SIZE))
+			SetPageUptodate(page);
+	}
+	return 0;
 }
 
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0) */
