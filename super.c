@@ -1281,13 +1281,25 @@ static void parse_options_set_flags(struct super_block *sb, struct apfs_sb_info 
  * apfs_set_default_opts - Set the default mount options in the superblock
  * @sbi: in-memory superblock info
  */
+/*
+ * Wipe the password before releasing it: mount options otherwise stay in
+ * freed memory for whoever reads it next.
+ */
+static void apfs_free_password(struct apfs_sb_info *sbi)
+{
+	if (!sbi->s_password)
+		return;
+	memzero_explicit(sbi->s_password, strlen(sbi->s_password));
+	kfree(sbi->s_password);
+	sbi->s_password = NULL;
+}
+
 static void apfs_set_default_opts(struct apfs_sb_info *sbi)
 {
 	sbi->s_vol_nr = 0;
 	sbi->s_snap_name = NULL;
 	sbi->s_tier2_path = NULL;
 	sbi->s_mount_opt = 0;
-	apfs_crypto_init(sbi);
 #ifdef CONFIG_APFS_RW_ALWAYS
 	/* Still risky, but some packagers want writable mounts by default */
 	sbi->s_mount_opt |= APFS_READWRITE;
@@ -1376,7 +1388,7 @@ static int parse_options(struct apfs_sb_info *sbi, char *options)
 				return -ENOMEM;
 			break;
 		case Opt_password:
-			kfree(sbi->s_password);
+			apfs_free_password(sbi);
 			sbi->s_password = match_strdup(&args[0]);
 			if (!sbi->s_password)
 				return -ENOMEM;
@@ -1438,7 +1450,7 @@ static int apfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			return -ENOMEM;
 		break;
 	case Opt_password:
-		kfree(sbi->s_password);
+		apfs_free_password(sbi);
 		sbi->s_password = kstrdup(param->string, GFP_KERNEL);
 		if (!sbi->s_password)
 			return -ENOMEM;
@@ -1546,11 +1558,15 @@ static int apfs_check_vol_features(struct super_block *sb)
 		return -EINVAL;
 	}
 	if (features & APFS_INCOMPAT_PFK) {
-		if (!apfs_crypto_ready(sb)) {
-			apfs_warn(sb, "PFK volumes need a software keybag and a password");
-			return -EINVAL;
-		}
-		apfs_info(sb, "PFK volume: per-file keys will be unwrapped on demand");
+		/*
+		 * Per-file keys are wrapped by hardware, not by the software
+		 * keybag: the reference requires hardware encryption for
+		 * per-file encryption, and the crypto state records it uses
+		 * exist only on iOS.  Refuse the volume instead of returning
+		 * ciphertext for most files.
+		 */
+		apfs_warn(sb, "per-file encryption requires hardware keys, which are not supported");
+		return -EINVAL;
 	}
 	if (features & APFS_INCOMPAT_SECONDARY_FSROOT) {
 		apfs_warn(sb, "secondary fsroot is not supported");
@@ -1593,8 +1609,7 @@ static int apfs_check_vol_features(struct super_block *sb)
 		}
 		sb->s_flags |= SB_RDONLY;
 		APFS_SB(sb)->s_onekey = features & APFS_FS_ONEKEY;
-		apfs_info(sb, "encrypted volume: keybag unlocked, %s keys",
-			  APFS_SB(sb)->s_onekey ? "volume" : "per-file");
+		apfs_info(sb, "encrypted volume: keybag unlocked");
 	}
 
 	features = le64_to_cpu(vsb_raw->apfs_readonly_compatible_features);
@@ -1708,8 +1723,7 @@ static int apfs_fill_super(struct super_block *sb, void *data, int silent)
 
 	if (apfs_vol_is_encrypted(sb) && sbi->s_password) {
 		err = apfs_crypto_unlock(sb, sbi->s_password);
-		kfree(sbi->s_password);
-		sbi->s_password = NULL;
+		apfs_free_password(sbi);
 		if (err) {
 			apfs_err(sb, "unable to unlock volume keybag: %d", err);
 			goto failed_omap;
@@ -2209,8 +2223,7 @@ static void apfs_free_sb_info(struct super_block *sb)
 	kfree(sbi->s_tier2_path);
 	sbi->s_tier2_path = NULL;
 	apfs_crypto_free(sbi);
-	kfree(sbi->s_password);
-	sbi->s_password = NULL;
+	apfs_free_password(sbi);
 	if (sbi->s_dflt_pfk)
 		kfree(sbi->s_dflt_pfk);
 	kfree(sbi);
@@ -2264,7 +2277,7 @@ static void apfs_free_fc(struct fs_context *fc)
 		kfree(sbi->s_snap_name);
 		kfree(sbi->s_tier2_path);
 		apfs_crypto_free(sbi);
-		kfree(sbi->s_password);
+		apfs_free_password(sbi);
 		kfree(sbi);
 	}
 }

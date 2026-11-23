@@ -369,6 +369,11 @@ int apfs_read_dstream_folio(struct apfs_dstream_info *dstream,
 	}
 	up_read(&nxi->nx_big_sem);
 	kunmap_local(kaddr);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	flush_dcache_folio(folio);
+#else
+	flush_dcache_page(&folio->page);
+#endif
 	return err;
 }
 

@@ -420,8 +420,6 @@ struct apfs_sb_info {
 	unsigned int s_master_key_len;
 	struct crypto_skcipher *s_xts;	/* XTS transform for volume data */
 	bool s_onekey;			/* every file uses the volume key */
-	struct list_head s_pfk_list;	/* Cached per-file key transforms */
-	struct mutex s_pfk_lock;	/* Protects s_pfk_list */
 
 	struct inode *s_private_dir;	/* Inode for the private directory */
 	struct work_struct s_orphan_cleanup_work;
@@ -973,7 +971,6 @@ extern int apfs_dstream_decrypt(struct apfs_dstream_info *dstream,
 				const void *src, void *dst, size_t len);
 extern int apfs_read_dstream_folio(struct apfs_dstream_info *dstream,
 				   struct folio *folio, size_t len);
-extern void apfs_crypto_init(struct apfs_sb_info *sbi);
 extern int apfs_create_omap_rec(struct super_block *sb, u64 oid, u64 bno);
 extern int apfs_delete_omap_rec(struct super_block *sb, u64 oid);
 extern int apfs_query_join_transaction(struct apfs_query *query);

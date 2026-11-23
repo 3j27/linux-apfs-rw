@@ -40,6 +40,10 @@ struct apfs_kek {
 	u8 salt[16];
 	u8 wrapped[40];
 	u32 wrapped_len;
+	bool have_id;
+	bool have_method;
+	bool have_wrapped;
+	bool have_salt;
 };
 
 struct apfs_keybag_scan {
@@ -47,12 +51,13 @@ struct apfs_keybag_scan {
 	const char *password;
 	u64 bag_block;
 	u64 bag_count;
-	u8 *master_kek;
-	unsigned int master_kek_len;
-	u8 *volume_key;
+	u8 *wrapped_vek;	/* DER of the container keybag's tag 2 */
+	unsigned int wrapped_vek_len;
+	u8 *kek;		/* unwrapped key-encryption key */
+	unsigned int kek_len;
 	bool found_bag;
-	bool found_master;
-	bool found_volume_key;
+	bool found_vek;
+	bool found_kek;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -363,7 +368,7 @@ static int apfs_tlv_next(const u8 **p, const u8 *end, struct apfs_tlv *tlv)
 		cur++;
 		if (cur + 2 > end)
 			return -EINVAL;
-		len = get_unaligned_le16(cur);
+		len = get_unaligned_be16(cur);
 		cur += 2;
 	} else {
 		return -EINVAL;
@@ -417,17 +422,26 @@ static int apfs_parse_kek(const u8 *data, unsigned int len, struct apfs_kek *kek
 			if (field.len != 16)
 				return -EINVAL;
 			memcpy(kek->id, field.val, 16);
+			kek->have_id = true;
 			break;
 		case 0x82:
-			if (field.len != 4)
+			/*
+			 * The key-info blob is a struct: flags first, then a
+			 * couple of bytes and the key's UUID.  apfs-fuse
+			 * accepts up to 0x16 bytes and only reads the flags,
+			 * so do the same rather than insisting on one size.
+			 */
+			if (field.len < 4 || field.len > 0x16)
 				return -EINVAL;
 			kek->method = get_unaligned_le32(field.val);
+			kek->have_method = true;
 			break;
 		case 0x83:
 			if (field.len != 40 && field.len != 24)
 				return -EINVAL;
 			memcpy(kek->wrapped, field.val, field.len);
 			kek->wrapped_len = field.len;
+			kek->have_wrapped = true;
 			break;
 		case 0x84:
 			if (!field.len || field.len > 8)
@@ -439,65 +453,109 @@ static int apfs_parse_kek(const u8 *data, unsigned int len, struct apfs_kek *kek
 			if (field.len != 16)
 				return -EINVAL;
 			memcpy(kek->salt, field.val, 16);
+			kek->have_salt = true;
 			break;
 		}
 	}
 	return 0;
 }
 
-static int apfs_kek_unwrap(const struct apfs_kek *kek, const u8 *unwrap_key,
-			   unsigned int unwrap_key_len, u8 *out,
-			   unsigned int out_len)
+/**
+ * apfs_kek_unwrap - Unwrap a key record with a key-wrap key
+ * @rec:	the parsed key record (KEK or VEK)
+ * @key:	the wrapping key
+ * @key_len:	16 or 32 bytes, independent of the wrapped record
+ * @vek:	is @rec the volume's VEK record?
+ * @out:	on return, the unwrapped key
+ * @out_len:	on entry the size of @out, on return the key length
+ *
+ * The wrapped length decides how long the unwrapped key is, but not how long
+ * the wrapping key is: a 128-bit KEK can wrap a 256-bit VEK.  Only the VEK
+ * record uses the FileVault convention where a 128-bit method wraps half the
+ * key and the other half is a hash of the first half and the record's UUID.
+ *
+ * Returns 0 on success or a negative error code in case of failure.
+ */
+static int apfs_kek_unwrap(const struct apfs_kek *rec, const u8 *key,
+			   unsigned int key_len, bool vek, u8 *out,
+			   unsigned int *out_len)
 {
 	u8 unwrapped[40];
+	unsigned int capacity = *out_len;
 	unsigned int used;
 	int err;
 
-	if (kek->method == 0 || kek->method == 16)
+	if (rec->method == 0 || rec->method == 16)
 		used = 32;
-	else if (kek->method == 2)
+	else if (rec->method == 2)
 		used = 16;
 	else
 		return -EOPNOTSUPP;
 
-	if (out_len < 32 || unwrap_key_len != used)
+	if (rec->wrapped_len != used + 8)
+		return -EINVAL;
+	if (key_len != 16 && key_len != 32)
+		return -EINVAL;
+	if (capacity < used || (vek && rec->method == 2 && capacity < 32))
 		return -EINVAL;
 
-	err = apfs_aes_kw_unwrap(unwrap_key, unwrap_key_len, kek->wrapped,
-				 kek->wrapped_len, unwrapped, sizeof(unwrapped));
+	err = apfs_aes_kw_unwrap(key, key_len, rec->wrapped, rec->wrapped_len,
+				 unwrapped, sizeof(unwrapped));
 	if (err)
 		return err;
 
 	/* RFC 3394 leaves the integrity vector in the first eight bytes. */
-	if (get_unaligned_be64(unwrapped) != 0xa6a6a6a6a6a6a6a6ULL)
-		return -EINVAL;
+	if (get_unaligned_be64(unwrapped) != 0xa6a6a6a6a6a6a6a6ULL) {
+		err = -EINVAL;
+		goto out;
+	}
 
 	memcpy(out, unwrapped + 8, used);
-	if (used < out_len)
-		memset(out + used, 0, out_len - used);
-	if (kek->method == 2) {
+	*out_len = used;
+	if (vek && rec->method == 2) {
 		u8 hash_in[32];
 		u8 hash[32];
 
+		/* FileVault-converted volumes wrap only the first half */
+		if (!rec->have_id) {
+			err = -EINVAL;
+			goto out;
+		}
 		memcpy(hash_in, out, 16);
-		memcpy(hash_in + 16, kek->id, 16);
+		memcpy(hash_in + 16, rec->id, 16);
 		err = apfs_sha256(hash_in, sizeof(hash_in), hash);
 		if (err)
-			return err;
+			goto out;
 		memcpy(out + 16, hash, 16);
+		*out_len = 32;
 		memzero_explicit(hash, sizeof(hash));
 	}
+
+out:
 	memzero_explicit(unwrapped, sizeof(unwrapped));
-	return 0;
+	return err;
 }
 
+/**
+ * apfs_kek_unlock_password - Unwrap a keybag's KEK record with a password
+ * @kek:	the parsed KEK record
+ * @password:	the user's password
+ * @out:	on return, the unwrapped KEK (16 or 32 bytes)
+ * @out_len:	on entry the size of @out, on return the KEK length
+ *
+ * Returns 0 on success or a negative error code in case of failure.
+ */
 static int apfs_kek_unlock_password(const struct apfs_kek *kek,
 				    const char *password, u8 *out,
-				    unsigned int out_len)
+				    unsigned int *out_len)
 {
 	u8 derived[32];
 	unsigned int key_len;
 	int err;
+
+	if (!kek->have_method || !kek->have_wrapped || !kek->have_salt ||
+	    !kek->iterations)
+		return -EINVAL;
 
 	if (kek->method == 0 || kek->method == 16)
 		key_len = 32;
@@ -509,8 +567,10 @@ static int apfs_kek_unlock_password(const struct apfs_kek *kek,
 	err = apfs_pbkdf2((const u8 *)password, strlen(password), kek->salt,
 			  16, kek->iterations, derived, key_len);
 	if (err)
-		return err;
-	err = apfs_kek_unwrap(kek, derived, key_len, out, out_len);
+		goto out;
+	err = apfs_kek_unwrap(kek, derived, key_len, false /* KEK */, out,
+			      out_len);
+out:
 	memzero_explicit(derived, sizeof(derived));
 	return err;
 }
@@ -535,11 +595,12 @@ static void apfs_container_keybag_entry(struct apfs_keybag_scan *scan,
 		scan->bag_count = get_unaligned_le64(data + 8);
 		scan->found_bag = true;
 	} else if (tag == APFS_KEYBAG_TAG_VOLKEY && len >= 24) {
-		kfree(scan->master_kek);
-		scan->master_kek = kmemdup(data, len, GFP_NOFS);
-		if (scan->master_kek) {
-			scan->master_kek_len = len;
-			scan->found_master = true;
+		/* The tag 2 entry is the DER-encoded, wrapped VEK record */
+		kfree(scan->wrapped_vek);
+		scan->wrapped_vek = kmemdup(data, len, GFP_NOFS);
+		if (scan->wrapped_vek) {
+			scan->wrapped_vek_len = len;
+			scan->found_vek = true;
 		}
 	}
 }
@@ -555,8 +616,9 @@ static void apfs_volume_keybag_entry(struct apfs_keybag_scan *scan,
 		return;
 	if (apfs_parse_kek(data, len, &kek))
 		return;
-	if (!apfs_kek_unlock_password(&kek, scan->password, scan->volume_key, 32))
-		scan->found_volume_key = true;
+	if (!apfs_kek_unlock_password(&kek, scan->password, scan->kek,
+				      &scan->kek_len))
+		scan->found_kek = true;
 }
 
 static int apfs_scan_keybag(struct super_block *sb, u64 start, u64 count,
@@ -642,8 +704,10 @@ int apfs_crypto_unlock(struct super_block *sb, const char *password)
 	struct apfs_nx_superblock *nx = sbi->s_nxi->nx_raw;
 	struct apfs_superblock *vsb = sbi->s_vsb_raw;
 	struct apfs_keybag_scan scan, vol_scan;
-	struct apfs_kek kek;
+	struct apfs_kek vek_rec;
 	u8 master[32];
+	u8 kek[32];
+	unsigned int master_len = sizeof(master);
 	u64 start, count;
 	int err;
 
@@ -660,34 +724,39 @@ int apfs_crypto_unlock(struct super_block *sb, const char *password)
 	err = apfs_scan_keybag(sb, start, count, (const u8 *)nx->nx_uuid,
 			       APFS_KEYBAG_MAGIC_KEYS,
 			       apfs_container_keybag_entry, &scan);
-	if (err || !scan.found_bag || !scan.found_master)
+	if (err || !scan.found_bag || !scan.found_vek)
 		goto out;
 
 	memset(&vol_scan, 0, sizeof(vol_scan));
 	vol_scan.volume_uuid = (const u8 *)vsb->apfs_vol_uuid;
 	vol_scan.password = password;
-	vol_scan.volume_key = kmalloc(32, GFP_NOFS);
-	if (!vol_scan.volume_key) {
-		err = -ENOMEM;
-		goto out;
-	}
+	vol_scan.kek = kek;
 
 	err = apfs_scan_keybag(sb, scan.bag_block, scan.bag_count,
 			       (const u8 *)vsb->apfs_vol_uuid,
 			       APFS_KEYBAG_MAGIC_RECS,
 			       apfs_volume_keybag_entry, &vol_scan);
-	if (err || !vol_scan.found_volume_key) {
+	if (err || !vol_scan.found_kek) {
 		err = err ?: -EINVAL;
 		goto out;
 	}
 
-	if (apfs_parse_kek(scan.master_kek, scan.master_kek_len, &kek)) {
+	if (apfs_parse_kek(scan.wrapped_vek, scan.wrapped_vek_len, &vek_rec)) {
 		err = -EINVAL;
 		goto out;
 	}
-	err = apfs_kek_unwrap(&kek, vol_scan.volume_key, 32, master, sizeof(master));
+	if (!vek_rec.have_wrapped || !vek_rec.have_method) {
+		err = -EINVAL;
+		goto out;
+	}
+	err = apfs_kek_unwrap(&vek_rec, vol_scan.kek, vol_scan.kek_len,
+			      true /* VEK */, master, &master_len);
 	if (err)
 		goto out;
+	if (master_len != sizeof(master)) {
+		err = -EINVAL;
+		goto out;
+	}
 
 	sbi->s_master_key = kmemdup(master, sizeof(master), GFP_NOFS);
 	if (!sbi->s_master_key) {
@@ -712,170 +781,16 @@ int apfs_crypto_unlock(struct super_block *sb, const char *password)
 
 	apfs_info(sb, "unlocked software-encrypted volume keybag");
 out:
-	if (vol_scan.volume_key) {
-		memzero_explicit(vol_scan.volume_key, 32);
-		kfree(vol_scan.volume_key);
+	if (scan.wrapped_vek) {
+		memzero_explicit(scan.wrapped_vek, scan.wrapped_vek_len);
+		kfree(scan.wrapped_vek);
 	}
-	if (scan.master_kek) {
-		memzero_explicit(scan.master_kek, scan.master_kek_len);
-		kfree(scan.master_kek);
-	}
+	memzero_explicit(kek, sizeof(kek));
 	memzero_explicit(master, sizeof(master));
 	return err;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Per-file keys (PFK)                                                       */
-
-/*
- * A per-file key, unwrapped from a crypto state record and kept until the
- * volume is unmounted.  The record is keyed by the crypto identifier that the
- * file's extents carry, so one entry serves every extent that names it.
- */
-struct apfs_pfk {
-	struct list_head	pfk_list;
-	u64			pfk_crypto_id;
-	struct crypto_skcipher	*pfk_tfm;
-};
-
-/**
- * apfs_pfk_build - Unwrap the per-file key named by a crypto identifier
- * @sb:		filesystem superblock
- * @crypto_id:	crypto identifier carried by the file's extents
- *
- * Finds the crypto state record (a D record keyed by @crypto_id), unwraps the
- * key it holds with the volume master key, and returns an XTS transform for
- * that key.  Returns an ERR_PTR in case of failure.
- */
-static struct crypto_skcipher *apfs_pfk_build(struct super_block *sb, u64 crypto_id)
-{
-	struct apfs_sb_info *sbi = APFS_SB(sb);
-	struct apfs_crypto_state_val *raw_val;
-	struct crypto_skcipher *tfm = NULL;
-	struct apfs_query *query;
-	unsigned int key_len, plain_len;
-	u8 *unwrapped;
-	int err;
-
-	query = apfs_alloc_query(sbi->s_cat_root, NULL /* parent */);
-	if (!query)
-		return ERR_PTR(-ENOMEM);
-	apfs_init_crypto_state_key(crypto_id, &query->key);
-	query->flags |= APFS_QUERY_CAT | APFS_QUERY_EXACT;
-
-	err = apfs_btree_query(sb, &query);
-	if (err) {
-		if (err == -ENODATA)
-			err = -EINVAL;
-		apfs_err(sb, "crypto state query failed for id 0x%llx", crypto_id);
-		apfs_free_query(query);
-		return ERR_PTR(err);
-	}
-
-	raw_val = (void *)query->node->object.data + query->off;
-	if (query->len < (int)sizeof(*raw_val)) {
-		apfs_err(sb, "crypto state record 0x%llx is too small", crypto_id);
-		apfs_free_query(query);
-		return ERR_PTR(-EFSCORRUPTED);
-	}
-	key_len = le16_to_cpu(raw_val->state.key_len);
-	if (query->len != (int)sizeof(*raw_val) + key_len ||
-	    key_len > APFS_CP_MAX_WRAPPEDKEYSIZE) {
-		apfs_err(sb, "bad wrapped key length (%u) in crypto state 0x%llx",
-			 key_len, crypto_id);
-		apfs_free_query(query);
-		return ERR_PTR(-EFSCORRUPTED);
-	}
-	/* The reference allows a record without a key: the volume key applies */
-	if (!key_len) {
-		apfs_free_query(query);
-		return ERR_PTR(-ENODATA);
-	}
-
-	unwrapped = kmalloc(key_len, GFP_KERNEL);
-	if (!unwrapped) {
-		apfs_free_query(query);
-		return ERR_PTR(-ENOMEM);
-	}
-	err = apfs_aes_kw_unwrap(sbi->s_master_key, sbi->s_master_key_len,
-				 raw_val->state.persistent_key, key_len,
-				 unwrapped, key_len);
-	if (err)
-		goto out;
-	/* RFC 3394 leaves the integrity vector in the first eight bytes */
-	if (get_unaligned_be64(unwrapped) != 0xa6a6a6a6a6a6a6a6ULL) {
-		apfs_err(sb, "crypto state 0x%llx is not wrapped by this volume",
-			 crypto_id);
-		err = -EINVAL;
-		goto out;
-	}
-	plain_len = key_len - 8;
-	if (plain_len != 32 && plain_len != 64) {
-		apfs_err(sb, "unexpected per-file key size (%u)", plain_len);
-		err = -EOPNOTSUPP;
-		goto out;
-	}
-
-	tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
-	if (IS_ERR(tfm)) {
-		err = PTR_ERR(tfm);
-		tfm = NULL;
-		goto out;
-	}
-	err = crypto_skcipher_setkey(tfm, unwrapped + 8, plain_len);
-	if (err) {
-		crypto_free_skcipher(tfm);
-		tfm = NULL;
-	}
-
-out:
-	memzero_explicit(unwrapped, key_len);
-	kfree(unwrapped);
-	apfs_free_query(query);
-	if (err)
-		return ERR_PTR(err);
-	return tfm;
-}
-
-/**
- * apfs_pfk_get - Find or build the transform for one crypto identifier
- * @sb:		filesystem superblock
- * @crypto_id:	crypto identifier carried by the file's extents
- *
- * The identifier is global to the volume, not to the file, so the cache is
- * shared by every inode.  Returns the transform, or an ERR_PTR.
- */
-static struct crypto_skcipher *apfs_pfk_get(struct super_block *sb, u64 crypto_id)
-{
-	struct apfs_sb_info *sbi = APFS_SB(sb);
-	struct apfs_pfk *pfk;
-	struct crypto_skcipher *tfm;
-
-	mutex_lock(&sbi->s_pfk_lock);
-	list_for_each_entry(pfk, &sbi->s_pfk_list, pfk_list) {
-		if (pfk->pfk_crypto_id == crypto_id) {
-			tfm = pfk->pfk_tfm;
-			goto out;
-		}
-	}
-
-	tfm = apfs_pfk_build(sb, crypto_id);
-	if (!IS_ERR(tfm)) {
-		pfk = kmalloc(sizeof(*pfk), GFP_KERNEL);
-		if (!pfk) {
-			crypto_free_skcipher(tfm);
-			tfm = ERR_PTR(-ENOMEM);
-		} else {
-			pfk->pfk_crypto_id = crypto_id;
-			pfk->pfk_tfm = tfm;
-			list_add_tail(&pfk->pfk_list, &sbi->s_pfk_list);
-		}
-	}
-out:
-	mutex_unlock(&sbi->s_pfk_lock);
-	return tfm;
-}
-
 /**
  * apfs_dstream_decrypt - Decrypt one block of a data stream
  * @dstream:	data stream the block belongs to
@@ -885,11 +800,12 @@ out:
  * @dst:	where to put the plaintext (may be NULL to mean @src)
  * @len:	number of bytes, a multiple of 512
  *
- * The crypto identifier of the extent says which key decrypts the extent: one
- * of the reserved identifiers means the data is in the clear or uses the
- * volume key, and anything else names a crypto state record with a per-file
- * key.  The tweak is the crypto identifier plus the block's offset within the
- * extent, measured in 512-byte sectors like every other XTS tweak here.
+ * The crypto identifier of the extent says which key decrypts the extent:
+ * APFS_CRYPTO_SW_ID means the volume key, and the identifiers that mean the
+ * data is in the clear are copied.  Any other identifier names a per-file key;
+ * that is a hardware-encryption feature (the reference requires hardware for
+ * PFK, and the crypto state records it uses are iOS-only), so it is refused
+ * rather than guessed at.
  *
  * Returns 0 on success or a negative error code in case of failure.
  */
@@ -923,46 +839,26 @@ int apfs_dstream_decrypt(struct apfs_dstream_info *dstream,
 	case APFS_UNASSIGNED_CRYPTO_ID:
 		return -EINVAL;
 	default:
-		if (sbi->s_onekey)
-			break;	/* the volume key encrypts every file */
-		{
-			struct crypto_skcipher *pfk = apfs_pfk_get(sb, crypto_id);
-
-			if (IS_ERR(pfk)) {
-				/* A crypto state record without a key means
-				 * the volume key applies; anything else is a
-				 * real failure. */
-				if (PTR_ERR(pfk) != -ENODATA)
-					return PTR_ERR(pfk);
-			} else
-				tfm = pfk;
-		}
-		break;
+		/*
+		 * A per-file key: those are wrapped by hardware, and the
+		 * catalog records that name them exist only on iOS.  Do not
+		 * hand back ciphertext, and do not pretend a software keybag
+		 * can unwrap them.
+		 */
+		apfs_err(sb, "per-file encryption needs hardware keys (id 0x%llx)",
+			 (unsigned long long)crypto_id);
+		return -EOPNOTSUPP;
 	}
 
 	tweak = (crypto_id + blk_off) * (sb->s_blocksize / 512);
 	return apfs_xts_crypt(tfm, src, dst, tweak, len, false);
 }
 
-void apfs_crypto_init(struct apfs_sb_info *sbi)
-{
-	INIT_LIST_HEAD(&sbi->s_pfk_list);
-	mutex_init(&sbi->s_pfk_lock);
-}
-
 void apfs_crypto_free(struct apfs_sb_info *sbi)
 {
-	struct apfs_pfk *pfk;
-	struct apfs_pfk *next;
-
 	if (sbi->s_xts) {
 		crypto_free_skcipher(sbi->s_xts);
 		sbi->s_xts = NULL;
-	}
-	list_for_each_entry_safe(pfk, next, &sbi->s_pfk_list, pfk_list) {
-		crypto_free_skcipher(pfk->pfk_tfm);
-		list_del(&pfk->pfk_list);
-		kfree(pfk);
 	}
 	if (sbi->s_master_key) {
 		memzero_explicit(sbi->s_master_key, sbi->s_master_key_len);

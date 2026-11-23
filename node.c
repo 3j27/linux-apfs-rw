@@ -156,6 +156,20 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 			brelse(bh);
 			return ERR_PTR(err);
 		}
+		/*
+		 * The checksum covers the plaintext, and the buffer head is
+		 * about to go away, so verify it here; skipping would leave
+		 * encrypted metadata unchecked even with cknodes.
+		 */
+		if (!(omap_flags & APFS_OMAP_VAL_NOHEADER) &&
+		    (nxi->nx_flags & APFS_CHECK_NODES) &&
+		    !apfs_multiblock_verify_csum(plain, sb->s_blocksize)) {
+			apfs_err(sb, "bad checksum for encrypted node in block 0x%llx",
+				 (unsigned long long)bno);
+			kfree(plain);
+			brelse(bh);
+			return ERR_PTR(-EFSBADCRC);
+		}
 		brelse(bh);
 		bh = NULL;
 		raw = plain;

@@ -97,17 +97,25 @@ static int apfs_readpages(struct file *file, struct address_space *mapping,
 			  struct list_head *pages, unsigned int nr_pages)
 {
 	struct inode *inode = mapping->host;
-	struct page *page;
+	struct page *page, *tmp;
 
 	if (!apfs_vol_is_encrypted(inode->i_sb))
 		return mpage_readpages(mapping, pages, nr_pages,
 				       apfs_get_block);
 
-	/* The merged read of mpage_readpages() cannot decrypt */
-	list_for_each_entry(page, pages, lru) {
+	/*
+	 * The merged read of mpage_readpages() cannot decrypt.  The pages
+	 * arrive locked and in the page cache, and the caller leaves the
+	 * leftovers alone, so take each one off the list, fill it, unlock it
+	 * and drop the reference, like mpage_readpages() does.
+	 */
+	list_for_each_entry_safe(page, tmp, pages, lru) {
+		list_del_init(&page->lru);
 		if (!apfs_read_dstream_folio(&APFS_I(inode)->i_dstream,
 					     page_folio(page), PAGE_SIZE))
 			SetPageUptodate(page);
+		unlock_page(page);
+		put_page(page);
 	}
 	return 0;
 }
