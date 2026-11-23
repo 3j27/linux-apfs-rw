@@ -232,7 +232,7 @@ static int apfs_omap_lookup_block_with_xid(struct super_block *sb, struct apfs_o
 
 		preserve = apfs_xid_in_snapshot(omap, map.xid);
 
-		new_bh = apfs_read_object_block(sb, *block, write, preserve);
+		new_bh = apfs_read_object_block(sb, *block, write, preserve, true);
 		if (IS_ERR(new_bh)) {
 			apfs_err(sb, "CoW failed for oid 0x%llx, xid 0x%llx", id, xid);
 			ret = PTR_ERR(new_bh);

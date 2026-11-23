@@ -1181,7 +1181,7 @@ extern void apfs_multiblock_set_csum(char *object, u32 size);
 extern int apfs_create_cpm_block(struct super_block *sb, u64 bno, struct buffer_head **bh_p);
 extern int apfs_create_cpoint_map(struct super_block *sb, struct apfs_checkpoint_map_phys *cpm, struct apfs_obj_phys *obj, u64 bno, u32 size);
 extern struct apfs_ephemeral_object_info *apfs_ephemeral_object_lookup(struct super_block *sb, u64 oid);
-extern struct buffer_head *apfs_read_object_block(struct super_block *sb, u64 bno, bool write, bool preserve);
+extern struct buffer_head *apfs_read_object_block(struct super_block *sb, u64 bno, bool write, bool preserve, bool verify);
 extern u32 apfs_index_in_data_area(struct super_block *sb, u64 bno);
 extern u64 apfs_data_index_to_bno(struct super_block *sb, u32 index);
 

@@ -38,7 +38,7 @@ struct apfs_kek {
 	u32 method;
 	u32 iterations;
 	u8 salt[16];
-	u8 wrapped[40];
+	u8 wrapped[72];
 	u32 wrapped_len;
 	bool have_id;
 	bool have_method;
@@ -450,7 +450,12 @@ static int apfs_parse_kek(const u8 *data, unsigned int len, struct apfs_kek *kek
 			kek->have_method = true;
 			break;
 		case 0x83:
-			if (field.len != 40 && field.len != 24)
+			/*
+			 * Wrapped keys are 16, 32 or 64 bytes plus the RFC
+			 * 3394 integrity vector; the key-wrap code checks the
+			 * resulting length, so only bound it here.
+			 */
+			if (field.len < 24 || field.len > sizeof(kek->wrapped))
 				return -EINVAL;
 			memcpy(kek->wrapped, field.val, field.len);
 			kek->wrapped_len = field.len;
@@ -493,23 +498,26 @@ static int apfs_kek_unwrap(const struct apfs_kek *rec, const u8 *key,
 			   unsigned int key_len, bool vek, u8 *out,
 			   unsigned int *out_len)
 {
-	u8 unwrapped[40];
+	u8 unwrapped[72];
 	unsigned int capacity = *out_len;
 	unsigned int used;
 	int err;
 
-	if (rec->method == 0 || rec->method == 16)
-		used = 32;
-	else if (rec->method == 2)
-		used = 16;
-	else
+	if (rec->method != 0 && rec->method != 2 && rec->method != 16)
 		return -EOPNOTSUPP;
-
-	if (rec->wrapped_len != used + 8)
+	/*
+	 * The wrapped length says how long the unwrapped key is; the method
+	 * only says how long the key doing the wrapping is (a 128-bit KEK can
+	 * wrap a 256-bit VEK).  AES-XTS-256 volumes use a 64-byte VEK.
+	 */
+	if (rec->wrapped_len < 24 || rec->wrapped_len > sizeof(unwrapped))
+		return -EINVAL;
+	used = rec->wrapped_len - 8;
+	if (used != 16 && used != 32 && used != 64)
 		return -EINVAL;
 	if (key_len != 16 && key_len != 32)
 		return -EINVAL;
-	if (capacity < used || (vek && rec->method == 2 && capacity < 32))
+	if (capacity < used || (vek && used == 16 && capacity < 32))
 		return -EINVAL;
 
 	err = apfs_aes_kw_unwrap(key, key_len, rec->wrapped, rec->wrapped_len,
@@ -525,7 +533,7 @@ static int apfs_kek_unwrap(const struct apfs_kek *rec, const u8 *key,
 
 	memcpy(out, unwrapped + 8, used);
 	*out_len = used;
-	if (vek && rec->method == 2) {
+	if (vek && used == 16) {
 		u8 hash_in[32];
 		u8 hash[32];
 
@@ -721,7 +729,7 @@ int apfs_crypto_unlock(struct super_block *sb, const char *password)
 	struct apfs_superblock *vsb = sbi->s_vsb_raw;
 	struct apfs_keybag_scan scan, vol_scan;
 	struct apfs_kek vek_rec;
-	u8 master[32];
+	u8 master[64];
 	u8 kek[32];
 	unsigned int master_len = sizeof(master);
 	u64 start, count;
@@ -769,17 +777,17 @@ int apfs_crypto_unlock(struct super_block *sb, const char *password)
 			      true /* VEK */, master, &master_len);
 	if (err)
 		goto out;
-	if (master_len != sizeof(master)) {
+	if (master_len != 32 && master_len != 64) {
 		err = -EINVAL;
 		goto out;
 	}
 
-	sbi->s_master_key = kmemdup(master, sizeof(master), GFP_NOFS);
+	sbi->s_master_key = kmemdup(master, master_len, GFP_NOFS);
 	if (!sbi->s_master_key) {
 		err = -ENOMEM;
 		goto out;
 	}
-	sbi->s_master_key_len = sizeof(master);
+	sbi->s_master_key_len = master_len;
 
 	sbi->s_xts = crypto_alloc_skcipher("xts(aes)", 0, 0);
 	if (IS_ERR(sbi->s_xts)) {

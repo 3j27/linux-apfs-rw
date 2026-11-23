@@ -94,7 +94,8 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 			return ERR_PTR(err);
 		}
 		/* CoW has already been done, don't worry about snapshots */
-		bh = apfs_read_object_block(sb, bno, write, false /* preserve */);
+		bh = apfs_read_object_block(sb, bno, write, false /* preserve */,
+				    !(omap_flags & APFS_OMAP_VAL_ENCRYPTED));
 		if (IS_ERR(bh)) {
 			apfs_err(sb, "object read failed for bno 0x%llx", bno);
 			return (void *)bh;
@@ -103,7 +104,7 @@ struct apfs_node *apfs_read_node(struct super_block *sb, u64 oid, u32 storage,
 		raw = (struct apfs_btree_node_phys *)bh->b_data;
 		break;
 	case APFS_OBJ_PHYSICAL:
-		bh = apfs_read_object_block(sb, oid, write, false /* preserve */);
+		bh = apfs_read_object_block(sb, oid, write, false /* preserve */, true);
 		if (IS_ERR(bh)) {
 			apfs_err(sb, "object read failed for bno 0x%llx", oid);
 			return (void *)bh;

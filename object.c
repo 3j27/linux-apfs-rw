@@ -228,7 +228,7 @@ struct apfs_ephemeral_object_info *apfs_ephemeral_object_lookup(struct super_blo
  * in a new location if write access was requested.  Returns an error pointer
  * in case of failure.
  */
-struct buffer_head *apfs_read_object_block(struct super_block *sb, u64 bno, bool write, bool preserve)
+struct buffer_head *apfs_read_object_block(struct super_block *sb, u64 bno, bool write, bool preserve, bool verify)
 {
 	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
 	struct apfs_superblock *vsb_raw = NULL;
@@ -249,7 +249,7 @@ struct buffer_head *apfs_read_object_block(struct super_block *sb, u64 bno, bool
 	obj = (struct apfs_obj_phys *)bh->b_data;
 	type = le32_to_cpu(obj->o_type);
 	ASSERT(!(type & APFS_OBJ_EPHEMERAL));
-	if (nxi->nx_flags & APFS_CHECK_NODES && !apfs_obj_verify_csum(sb, bh)) {
+	if (verify && (nxi->nx_flags & APFS_CHECK_NODES) && !apfs_obj_verify_csum(sb, bh)) {
 		apfs_err(sb, "bad checksum for object in block 0x%llx", bno);
 		err = -EFSBADCRC;
 		goto fail;

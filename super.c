@@ -624,7 +624,7 @@ int apfs_map_volume_super(struct super_block *sb, bool write)
 
 	/* Get the container's object map */
 	bh = apfs_read_object_block(sb, le64_to_cpu(msb_raw->nx_omap_oid),
-				    write, false /* preserve */);
+				    write, false /* preserve */, true);
 	if (IS_ERR(bh)) {
 		apfs_err(sb, "unable to read container object map");
 		return PTR_ERR(bh);
@@ -758,7 +758,7 @@ int apfs_read_omap(struct super_block *sb, bool write)
 
 	/* Get the block holding the volume omap information */
 	omap_blk = le64_to_cpu(vsb_raw->apfs_omap_oid);
-	bh = apfs_read_object_block(sb, omap_blk, write, false /* preserve */);
+	bh = apfs_read_object_block(sb, omap_blk, write, false /* preserve */, true);
 	if (IS_ERR(bh)) {
 		apfs_err(sb, "unable to read the volume object map");
 		return PTR_ERR(bh);

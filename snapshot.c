@@ -312,7 +312,7 @@ static int apfs_update_omap_snapshots(struct super_block *sb)
 	xid = APFS_NXI(sb)->nx_xid;
 
 	omap_blk = le64_to_cpu(vsb_raw->apfs_omap_oid);
-	bh = apfs_read_object_block(sb, omap_blk, true /* write */, false /* preserve */);
+	bh = apfs_read_object_block(sb, omap_blk, true /* write */, false /* preserve */, true);
 	if (IS_ERR(bh)) {
 		apfs_err(sb, "CoW failed for bno 0x%llx", omap_blk);
 		return PTR_ERR(bh);
